@@ -314,21 +314,36 @@ export class AgentIdentity {
 
   // ── DID Document ──
 
-  /** Export as a W3C DID Document. */
+  /** Export as a W3C DID Document.
+   *
+   * Uses JsonWebKey2020 with publicKeyJwk (RFC 7517) per W3C DID Core §5.2.1.
+   * Declares all verification relationships per §5.3.
+   */
   toDIDDocument(): Record<string, unknown> {
     const keyId = `${this.did}#key-${createHash('sha256').update(this.publicKey).digest('hex').slice(0, 16)}`;
+    const publicKeyJwk = {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: base64urlEncode(this.getRawPublicKeyBytes()),
+    };
     return {
-      '@context': ['https://www.w3.org/ns/did/v1'],
+      '@context': [
+        'https://www.w3.org/ns/did/v1',
+        'https://w3id.org/security/suites/jws-2020/v1',
+      ],
       id: this.did,
       verificationMethod: [
         {
           id: keyId,
-          type: 'Ed25519VerificationKey2020',
+          type: 'JsonWebKey2020',
           controller: this.did,
-          publicKeyBase64: Buffer.from(this.publicKey).toString('base64'),
+          publicKeyJwk,
         },
       ],
       authentication: [keyId],
+      assertionMethod: [keyId],
+      capabilityDelegation: [keyId],
+      capabilityInvocation: [keyId],
       service: [
         {
           id: `${this.did}#agentmesh`,

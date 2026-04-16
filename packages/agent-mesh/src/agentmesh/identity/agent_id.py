@@ -287,11 +287,58 @@ class AgentIdentity(BaseModel):
 
         return child
 
-    def revoke(self, reason: str) -> None:
-        """Revoke this identity."""
+    def revoke(self, reason: str) -> Optional[dict]:
+        """Revoke this identity.
+
+        If a private key is available, produces a signed revocation proof
+        that third parties can verify independently. Otherwise revocation
+        is state-only (registry-authoritative).
+
+        Returns:
+            Signed revocation proof dict, or None if no private key.
+        """
         self.status = "revoked"
         self.revocation_reason = reason
         self.updated_at = datetime.utcnow()
+
+        if self._private_key is None:
+            return None
+
+        timestamp = datetime.utcnow().isoformat()
+        message = f"agentmesh:revoke:v1:{self.did}:{reason}:{timestamp}"
+        signature = self._private_key.sign(message.encode())
+        proof = {
+            "type": "Ed25519RevocationProof",
+            "did": str(self.did),
+            "reason": reason,
+            "timestamp": timestamp,
+            "message": message,
+            "signature": base64.b64encode(signature).decode(),
+        }
+        return proof
+
+    @staticmethod
+    def verify_revocation_proof(proof: dict, public_key_b64: str) -> bool:
+        """Verify a signed revocation proof against a public key.
+
+        Args:
+            proof: Revocation proof dict from revoke().
+            public_key_b64: Base64-encoded Ed25519 public key of the revoker.
+
+        Returns:
+            True if the proof signature is valid.
+        """
+        try:
+            if proof.get("type") != "Ed25519RevocationProof":
+                return False
+            key_bytes = base64.b64decode(public_key_b64)
+            key = ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
+            message = proof.get("message", "")
+            sig_bytes = base64.b64decode(proof.get("signature", ""))
+            key.verify(sig_bytes, message.encode())
+            return True
+        except Exception:
+            return False
 
     def suspend(self, reason: str) -> None:
         """Temporarily suspend this identity."""
@@ -498,19 +545,36 @@ class AgentIdentity(BaseModel):
         return sorted(current_caps)
 
     def to_did_document(self) -> dict:
-        """Export as a DID Document (W3C format)."""
+        """Export as a W3C DID Document.
+
+        Uses JsonWebKey2020 with publicKeyJwk (RFC 7517) per W3C DID Core §5.2.1.
+        Declares all verification relationships per §5.3.
+        """
+        key_ref = f"{self.did}#{self.verification_key_id}"
+        pub_bytes = base64.b64decode(self.public_key)
+        public_key_jwk = {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": base64.urlsafe_b64encode(pub_bytes).rstrip(b"=").decode("ascii"),
+        }
         return {
-            "@context": ["https://www.w3.org/ns/did/v1"],
+            "@context": [
+                "https://www.w3.org/ns/did/v1",
+                "https://w3id.org/security/suites/jws-2020/v1",
+            ],
             "id": str(self.did),
             "verificationMethod": [
                 {
-                    "id": f"{self.did}#{self.verification_key_id}",
-                    "type": "Ed25519VerificationKey2020",
+                    "id": key_ref,
+                    "type": "JsonWebKey2020",
                     "controller": str(self.did),
-                    "publicKeyBase64": self.public_key,
+                    "publicKeyJwk": public_key_jwk,
                 }
             ],
-            "authentication": [f"{self.did}#{self.verification_key_id}"],
+            "authentication": [key_ref],
+            "assertionMethod": [key_ref],
+            "capabilityDelegation": [key_ref],
+            "capabilityInvocation": [key_ref],
             "service": [
                 {
                     "id": f"{self.did}#agentmesh",

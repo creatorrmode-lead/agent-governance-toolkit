@@ -204,10 +204,18 @@ class TrustHandshake:
         self._max_pending_challenges = 1000
 
     def _get_cached_result(self, peer_did: str) -> Optional[HandshakeResult]:
-        """Get cached verification result if still valid."""
+        """Get cached verification result if still valid and peer is still active."""
         if peer_did in self._verified_peers:
             result, timestamp = self._verified_peers[peer_did]
             if datetime.utcnow() - timestamp < self._cache_ttl:
+                # Check peer is still active in registry (prevents stale cache
+                # after revocation — otherwise revoked peers stay trusted for
+                # up to cache_ttl_seconds).
+                if self.registry:
+                    peer = self.registry.get(peer_did)
+                    if not peer or not peer.is_active():
+                        del self._verified_peers[peer_did]
+                        return None
                 return result
             del self._verified_peers[peer_did]
         return None

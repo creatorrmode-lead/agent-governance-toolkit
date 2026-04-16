@@ -47,6 +47,7 @@ class KeyRotationManager:
         self._max_history = max_history
         self._last_rotation_time: float = time.monotonic()
         self._key_history: list[dict] = []
+        self._rotation_sequence: int = 0
 
     @property
     def identity(self) -> AgentIdentity:
@@ -77,9 +78,11 @@ class KeyRotationManager:
         )
         new_public_key_b64 = base64.b64encode(new_public_key_bytes).decode()
 
-        # Build and store rotation proof
+        # Build and store rotation proof with sequence number
+        self._rotation_sequence += 1
         proof = self._create_rotation_proof(
-            old_private_key, old_public_key_b64, new_public_key_b64
+            old_private_key, old_public_key_b64, new_public_key_b64,
+            sequence=self._rotation_sequence,
         )
 
         # Record old key in history
@@ -135,6 +138,7 @@ class KeyRotationManager:
         old_public_key: str,
         new_public_key: str,
         proof: dict,
+        max_age_seconds: int = 300,
     ) -> bool:
         """Verify that a rotation proof correctly links old and new keys.
 
@@ -142,14 +146,29 @@ class KeyRotationManager:
             old_public_key: Base64-encoded old public key.
             new_public_key: Base64-encoded new public key.
             proof: The rotation proof dict produced during rotation.
+            max_age_seconds: Maximum age of the proof in seconds (default 300s).
 
         Returns:
-            True if the proof is valid.
+            True if the proof is valid, fresh, and contains a sequence number.
         """
         try:
             if proof.get("old_public_key") != old_public_key:
                 return False
             if proof.get("new_public_key") != new_public_key:
+                return False
+
+            # Timestamp freshness check
+            timestamp_str = proof.get("timestamp")
+            if not timestamp_str:
+                return False
+            proof_time = datetime.fromisoformat(timestamp_str)
+            age = (datetime.utcnow() - proof_time).total_seconds()
+            if age > max_age_seconds or age < -60:
+                return False
+
+            # Sequence must be present and positive
+            sequence = proof.get("sequence")
+            if not isinstance(sequence, int) or sequence < 1:
                 return False
 
             old_key_bytes = base64.b64decode(old_public_key)
@@ -176,6 +195,48 @@ class KeyRotationManager:
         return list(self._key_history)
 
     # ------------------------------------------------------------------
+    # Serialization (persist across restarts)
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Serialize rotation state for persistence.
+
+        Returns a dict suitable for JSON storage. Restore with ``from_dict()``.
+        Does NOT include the private key — the caller must supply the
+        identity (with private key) when restoring.
+        """
+        return {
+            "rotation_sequence": self._rotation_sequence,
+            "rotation_ttl_seconds": self._rotation_ttl_seconds,
+            "max_history": self._max_history,
+            "key_history": list(self._key_history),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        identity: AgentIdentity,
+    ) -> "KeyRotationManager":
+        """Restore a KeyRotationManager from serialized state.
+
+        Args:
+            data: Dict from ``to_dict()``.
+            identity: The agent identity (must have private key).
+
+        Returns:
+            A KeyRotationManager with restored history and sequence.
+        """
+        manager = cls(
+            identity=identity,
+            rotation_ttl_seconds=data.get("rotation_ttl_seconds", 86400),
+            max_history=data.get("max_history", 5),
+        )
+        manager._key_history = data.get("key_history", [])
+        manager._rotation_sequence = data.get("rotation_sequence", 0)
+        return manager
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -184,13 +245,19 @@ class KeyRotationManager:
         old_private_key: ed25519.Ed25519PrivateKey,
         old_public_key_b64: str,
         new_public_key_b64: str,
+        sequence: int = 1,
     ) -> dict:
-        """Create a rotation proof: the old key signs the new public key."""
-        message = f"rotate:{old_public_key_b64}:{new_public_key_b64}"
+        """Create a rotation proof: the old key signs the new public key.
+
+        Message format includes domain separator and sequence number to
+        prevent cross-protocol collisions and proof reordering.
+        """
+        message = f"agentmesh:rotate:v1:{sequence}:{old_public_key_b64}:{new_public_key_b64}"
         signature = old_private_key.sign(message.encode())
         return {
             "old_public_key": old_public_key_b64,
             "new_public_key": new_public_key_b64,
+            "sequence": sequence,
             "message": message,
             "signature": base64.b64encode(signature).decode(),
             "timestamp": datetime.utcnow().isoformat(),
